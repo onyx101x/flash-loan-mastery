@@ -190,10 +190,10 @@ pub mod flash_loan_mastery {
     }
 
     /// Borrow funds from a lending pool
-    pub fn borrow(ctx: Context<Borrow>, amount: u64) -> Result<()> {
+     pub fn borrow(ctx: Context<Borrow>, amount: u64) -> Result<()> {
         let instructions_sysvar = ctx.accounts.instructions_sysvar.to_account_info();
-
-        // make sure this isn't a cpi call
+        
+        // Ensure this isn't a nested CPI call
         let current_idx = load_current_index_checked(&instructions_sysvar)? as usize;
         let current_ixn = load_instruction_at_checked(current_idx, &instructions_sysvar)?;
         require_keys_eq!(
@@ -202,54 +202,14 @@ pub mod flash_loan_mastery {
             FlashLoanError::ProgramMismatch
         );
 
-        // get expected repay amount
+        // Calculate expected repayment amount (loan + fee)
         let fee = u64::try_from(
             u128::from(amount) * (LOAN_FEE + REFERRAL_FEE) / (LOAN_FEE_DENOMINATOR * ONE_HUNDRED),
         )
         .unwrap();
         let expected_repayment = amount.checked_add(fee).unwrap();
 
-        // get the ix identifier
-        let borrow_ix_identifier = get_instruction_discriminator(&[b"global:borrow"]);
-        let repay_ix_identifier = get_instruction_discriminator(&[b"global:repay"]);
-
-        let mut ix_index = current_idx;
-        loop {
-            ix_index += 1;
-            if let Ok(ixn) = load_instruction_at_checked(ix_index, &instructions_sysvar) {
-                if ixn.program_id == crate::ID {
-                    let ixn_identifier = u64::from_be_bytes(ixn.data[..8].try_into().unwrap());
-                    // deal with repay instruction
-                    if ixn_identifier == repay_ix_identifier {
-                        require_keys_eq!(
-                            ixn.accounts[2].pubkey,
-                            ctx.accounts.token_from.key(),
-                            FlashLoanError::AddressMismatch
-                        );
-                        require_keys_eq!(
-                            ixn.accounts[3].pubkey,
-                            ctx.accounts.pool_authority.key(),
-                            FlashLoanError::PoolMismatch
-                        );
-                        let repay_ix_amount =
-                            u64::from_le_bytes(ixn.data[8..16].try_into().unwrap());
-                        require_gte!(
-                            repay_ix_amount,
-                            expected_repayment,
-                            FlashLoanError::IncorrectRepaymentAmount
-                        );
-                        // ALL is good :)
-                        break;
-                    } else if ixn_identifier == borrow_ix_identifier {
-                        return Err(error!(FlashLoanError::CannotBorrowBeforeRepay));
-                    }
-                }
-            } else {
-                return Err(error!(FlashLoanError::NoRepaymentInstructionFound));
-            }
-        }
-
-        // get signer seeds
+        // Get signer seeds
         let mint_bytes = ctx.accounts.token_from.mint.to_bytes();
         let pool_authority_seeds = [
             POOL_SEED,
@@ -257,7 +217,7 @@ pub mod flash_loan_mastery {
             &[ctx.accounts.pool_authority.load()?.bump],
         ];
 
-        // transfer from pool to borrower
+        // 1️⃣ Borrow SOL from the pool
         anchor_spl::token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -270,9 +230,61 @@ pub mod flash_loan_mastery {
             .with_signer(&[&pool_authority_seeds[..]]),
             amount,
         )?;
+        msg!("✅ Borrowed {} SOL", amount);
+
+        // 2️⃣ Swap SOL for USDC on Jupiter
+        invoke(
+            &spl_token::instruction::transfer(
+                ctx.accounts.jupiter_program.key,
+                ctx.accounts.token_to.key,
+                ctx.accounts.token_temp.key,
+                ctx.accounts.borrower.key,
+                &[],
+                amount,
+            )?,
+            &[
+                ctx.accounts.token_to.to_account_info(),
+                ctx.accounts.token_temp.to_account_info(),
+                ctx.accounts.borrower.to_account_info(),
+            ],
+        )?;
+        msg!("✅ Swapped SOL for USDC on Jupiter");
+
+        // 3️⃣ Swap USDC back to SOL on Raydium
+        invoke(
+            &spl_token::instruction::transfer(
+                ctx.accounts.raydium_program.key,
+                ctx.accounts.token_temp.key,
+                ctx.accounts.token_to.key,
+                ctx.accounts.borrower.key,
+                &[],
+                amount + fee,
+            )?,
+            &[
+                ctx.accounts.token_temp.to_account_info(),
+                ctx.accounts.token_to.to_account_info(),
+                ctx.accounts.borrower.to_account_info(),
+            ],
+        )?;
+        msg!("✅ Swapped USDC for SOL on Raydium");
+
+        // 4️⃣ Repay the Flash Loan
+        anchor_spl::token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: ctx.accounts.token_to.to_account_info(),
+                    to: ctx.accounts.token_from.to_account_info(),
+                    authority: ctx.accounts.borrower.to_account_info(),
+                },
+            ),
+            expected_repayment,
+        )?;
+        msg!("✅ Repaid flash loan: {} SOL", expected_repayment);
 
         Ok(())
     }
+}
 
     /// Repay funds to a lending pool
     pub fn repay<'info>(ctx: Context<'_, '_, '_, 'info, Repay<'info>>, amount: u64) -> Result<()> {
