@@ -513,6 +513,16 @@ pub struct Borrow<'info> {
     #[account(mut)]
     pub token_to: UncheckedAccount<'info>,
 
+    pub token_temp: Account<'info, TokenAccount>, // Temporary USDC holding
+    #[account(mut)]
+    pub pool_authority: AccountLoader<'info, PoolAuthority>,
+    #[account(mut)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub jupiter_program: UncheckedAccount<'info>,  // Jupiter DEX
+    #[account(mut)]
+    pub raydium_program: UncheckedAccount<'info>,  // Raydium DEX
+    pub token_program: Program<'info, Token>,
     /// The pool authority
     /// CHECK: checked with seeds & in token program
     #[account(
